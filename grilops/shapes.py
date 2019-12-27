@@ -1,9 +1,10 @@
 """This module supports puzzles that place fixed shape regions into the grid."""
 
 import sys
+from collections import defaultdict
 from typing import List, Tuple
-from z3 import And, ArithRef, If, Int, Or, Solver, Sum, PbEq  # type: ignore
-
+from z3 import And, ArithRef, If, Implies, Int, Or, Solver, Sum, \
+               PbEq  # type: ignore
 
 def rotate_shape_clockwise(shape):
   """Returns a new shape coordinate list rotated 90 degrees clockwise.
@@ -15,12 +16,7 @@ def rotate_shape_clockwise(shape):
   (List[Tuple[int, int]]): A list of (y, x) coordinates defining the 90-degree
       clockwise rotation of the input shape.
   """
-  min_y = min(p[0] for p in shape)
-  max_y = max(p[0] for p in shape)
-  rotated_shape = []
-  for y, x in shape:
-    rotated_shape.append((x, max_y - min_y - y))
-  return rotated_shape
+  return [(x, -y) for (y, x) in shape]
 
 
 def reflect_shape_y(shape):
@@ -33,12 +29,7 @@ def reflect_shape_y(shape):
   (List[Tuple[int, int]]): A list of (y, x) coordinates defining the vertical
       reflection of the input shape.
   """
-  min_y = min(p[0] for p in shape)
-  max_y = max(p[0] for p in shape)
-  reflected_shape = []
-  for y, x in shape:
-    reflected_shape.append((max_y - min_y - y, x))
-  return reflected_shape
+  return [(-y, x) for (y, x) in shape]
 
 
 def reflect_shape_x(shape):
@@ -51,12 +42,25 @@ def reflect_shape_x(shape):
   (List[Tuple[int, int]]): A list of (y, x) coordinates defining the horizontal
       reflection of the input shape.
   """
+  return [(y, -x) for (y, x) in shape]
+
+
+def canonicalize_shape(shape):
+  """Returns a new shape that's canonicalized, i.e., it's in sorted order
+  and its minimum x and y values are both 0.  This helps with deduplication,
+  since equivalent shapes will be canonicalized identically.
+
+  # Arguments:
+  shape (List[Tuple[int, int]]): A list of (y, x) coordinates defining a shape.
+
+  # Returns.
+  (List[Tuple[int, int]]): A list of (y, x) coordinates defining the
+  canonicalized version of the shape.
+  """
+  min_y = min(p[0] for p in shape)
   min_x = min(p[1] for p in shape)
-  max_x = max(p[1] for p in shape)
-  reflected_shape = []
-  for y, x in shape:
-    reflected_shape.append((y, max_x - min_x - x))
-  return reflected_shape
+  canonicalized_shape = [(y - min_y, x - min_x) for (y, x) in shape]
+  return sorted(canonicalized_shape)
 
 
 class ShapeConstrainer:
@@ -80,6 +84,10 @@ class ShapeConstrainer:
       placed in the grid. Defaults to false.
   allow_copies (bool): If true, allow any number of copies of the shapes to be
       placed in the grid. Defaults to false.
+  max_num_instances (int, None): An upper bound on the total number of shape
+      occurences in the grid. Ignored if allow_copies is false, since in that
+      case the exact number of instances is known. If None, no upper bound is
+      assumed. Defaults to None.
   """
   _instance_index = 0
 
@@ -92,7 +100,8 @@ class ShapeConstrainer:
       complete: bool = False,
       allow_rotations: bool = False,
       allow_reflections: bool = False,
-      allow_copies: bool = False
+      allow_copies: bool = False,
+      max_num_instances: int = None
   ):
     ShapeConstrainer._instance_index += 1
     if solver:
@@ -103,10 +112,21 @@ class ShapeConstrainer:
     self.__complete = complete
     self.__allow_copies = allow_copies
 
+    if self.__allow_copies:
+      if max_num_instances is None:
+        max_shape_size = min(len(shape) for shape in shapes)
+        self.__max_num_instances = (height * width) // max_shape_size
+      else:
+        self.__max_num_instances = max_num_instances
+    else:
+      self.__max_num_instances = len(shapes)
+
     self.__shapes = shapes
     self.__variants = self.__make_variants(allow_rotations, allow_reflections)
+    self.__make_placements(height, width)
 
     self.__create_grids(height, width)
+    self.__create_instances()
     self.__add_constraints()
 
   def __make_variants(self, allow_rotations, allow_reflections):
@@ -123,25 +143,32 @@ class ShapeConstrainer:
           more_variants.append(reflect_shape_y(variant))
           more_variants.append(reflect_shape_x(variant))
         variants = more_variants
-      variants = [list(s) for s in {tuple(sorted(s)) for s in variants}]
+      variants = [
+        list(s)
+        for s in {tuple(canonicalize_shape(s)) for s in variants}
+      ]
       all_variants.append(variants)
     return all_variants
 
+  def __make_placements(self, height, width):
+    """Create the list of list of placements, one list of placements
+    for each shape.
+    """
+    self.__placements = []
+    for shape_type in range(len(self.__shapes)):
+      placements = []
+      for variant_index, variant in enumerate(self.__variants[shape_type]):
+        max_dy = max(p[0] for p in variant)
+        max_dx = max(p[1] for p in variant)
+        unfitting_y = height - max_dy
+        unfitting_x = width - max_dx
+        for y in range(unfitting_y):
+          for x in range(unfitting_x):
+            placements.append((y, x, variant_index))
+      self.__placements.append(placements)
+
   def __create_grids(self, height: int, width: int):
     """Create the grids used to model shape region constraints."""
-    self.__shape_type_grid: List[List[ArithRef]] = []
-    for y in range(height):
-      row = []
-      for x in range(width):
-        v = Int(f"scst-{ShapeConstrainer._instance_index}-{y}-{x}")
-        if self.__complete:
-          self.__solver.add(v >= 0)
-        else:
-          self.__solver.add(v >= -1)
-        self.__solver.add(v < len(self.__shapes))
-        row.append(v)
-      self.__shape_type_grid.append(row)
-
     self.__shape_instance_grid: List[List[ArithRef]] = []
     for y in range(height):
       row = []
@@ -155,88 +182,168 @@ class ShapeConstrainer:
         row.append(v)
       self.__shape_instance_grid.append(row)
 
-  def __add_constraints(self):
-    self.__add_grid_agreement_constraints()
-    self.__add_shape_instance_constraints()
-    if not self.__allow_copies:
-      for shape_index, shape in enumerate(self.__shapes):
-        self.__add_single_copy_constraints(shape_index, shape)
+    if self.__allow_copies:
+      self.__shape_type_grid: List[List[ArithRef]] = []
+      for y in range(height):
+        row = []
+        for x in range(width):
+          v = Int(f"scst-{ShapeConstrainer._instance_index}-{y}-{x}")
+          if self.__complete:
+            self.__solver.add(v >= 0)
+          else:
+            self.__solver.add(v >= -1)
+          self.__solver.add(v < len(self.__shapes))
+          row.append(v)
+        self.__shape_type_grid.append(row)
 
-  def __add_grid_agreement_constraints(self):
-    for y in range(len(self.__shape_type_grid)):
-      for x in range(len(self.__shape_type_grid[0])):
+  def __create_instances(self):
+    """Create arrays of variables representing the shape instances."""
+
+    # The instance-placement array is an array of variables,
+    # one for each shape instance.  It indicates which placement
+    # of that instance is used in the grid.  A "placement"
+    # is a per-shape ID representing a specific variant of that
+    # shape and a specific position in the grid where that
+    # variant is placed.
+
+    self.__instance_placements: List[ArithRef] = [
+        Int(f"scip-{ShapeConstrainer._instance_index}-{instance_index}")
+        for instance_index in range(self.__max_num_instances)
+    ]
+
+    # The instance-shapes array is an array of variables, one for each shape
+    # instance.  It indicates which shape is used for that instance (or -1 if
+    # the instance doesn't correspond to a shape). There's no need for an
+    # instance-shapes array when allow_copies is false, since in that case it's
+    # clear which shape is used for each instance: shape i is used for instance
+    # i.
+
+    if self.__allow_copies:
+      self.__instance_shapes: List[ArithRef] = [
+        Int(f"scis-{ShapeConstrainer._instance_index}-{instance_index}")
+        for instance_index in range(self.__max_num_instances)
+      ]
+
+  def __add_constraints(self):
+    self.__add_instance_array_constraints()
+    self.__add_grid_constraints()
+
+    for shape_type in range(len(self.__shapes)):
+      self.__add_shape_constraints(shape_type)
+
+  def __add_instance_array_constraints(self):
+    for instance_index in range(self.__max_num_instances):
+      placement = self.__instance_placements[instance_index]
+      if not self.__allow_copies:
+        self.__solver.add(placement >= 0)
+        self.__solver.add(placement < len(self.__placements[instance_index]))
+        continue
+      
+      shape = self.__instance_shapes[instance_index]
+      self.__solver.add(shape >= -1)
+      self.__solver.add(shape < len(self.__shapes))
+      self.__solver.add(placement >= -1)
+      self.__solver.add((shape == -1) == (placement == -1))
+      for shape_type in range(len(self.__shapes)):
         self.__solver.add(
-            Or(
-                And(
-                    self.__shape_type_grid[y][x] == -1,
-                    self.__shape_instance_grid[y][x] == -1
-                ),
-                And(
-                    self.__shape_type_grid[y][x] != -1,
-                    self.__shape_instance_grid[y][x] != -1
-                )
+            Implies(
+                shape == shape_type,
+                placement < len(self.__placements[shape_type])
             )
         )
 
-  def __add_shape_instance_constraints(self):
-    for gy in range(len(self.__shape_instance_grid)):
-      for gx in range(len(self.__shape_instance_grid[0])):
-        instance_id = gy * len(self.__shape_instance_grid[0]) + gx
-        instance_size = Sum(*[
-            If(c == instance_id, 1, 0)
-            for row in self.__shape_instance_grid
-            for c in row
-        ])
+      # To reduce non-determinism, we force instances to be ordered by shape
+      # index, followed by placement.
 
-        or_terms = [self.__shape_instance_grid[gy][gx] == -1]
-        for shape_index, variants in enumerate(self.__variants):
-          for variant in variants:
-            or_terms.extend(self.__make_instance_constraints_for_variant(
-                gy, gx, shape_index, variant, instance_size))
-        self.__solver.add(Or(*or_terms))
+      if instance_index > 0:
+        prev_placement = self.__instance_placements[instance_index - 1]
+        prev_shape = self.__instance_shapes[instance_index - 1]
+        self.__solver.add(
+            Or(shape == -1, And(shape >= prev_shape, prev_shape != -1))
+        )
+        self.__solver.add(
+            Implies(shape == prev_shape, placement >= prev_placement)
+        )
 
-  # pylint: disable=R0913,R0914
-  def __make_instance_constraints_for_variant(
-      self, gy, gx, shape_index, variant, instance_size):
-    or_terms = []
-    # Identify an instance by its first defined coordinate.
-    sidy, sidx = variant[0]
-    for (sry, srx) in variant:
-      # Find the id coordinate when (sry, srx) is at (gy, gx).
-      gidy, gidx = gy - (sry - sidy), gx - (srx - sidx)
-      instance_id = gidy * len(self.__shape_instance_grid[0]) + gidx
-      constraint = self.__make_instance_constraint_for_variant_coordinate(
-          gy, gx, sry, srx, shape_index, variant, instance_id)
-      if gy == gidy and gx == gidx:
-        constraint = And(constraint, instance_size == len(variant))
-      or_terms.append(constraint)
-    return or_terms
+  def __add_grid_constraints(self):
+    for y in range(len(self.__shape_instance_grid)):
+      for x in range(len(self.__shape_instance_grid[0])):
+        grid_instance = self.__shape_instance_grid[y][x]
+        if self.__complete:
+          self.__solver.add(grid_instance >= 0)
+        else:
+          self.__solver.add(grid_instance >= -1)
+        self.__solver.add(grid_instance < self.__max_num_instances)
 
-  # pylint: disable=R0913
-  def __make_instance_constraint_for_variant_coordinate(
-      self, gy, gx, sry, srx, shape_index, variant, instance_id):
-    and_terms = []
-    for (spy, spx) in variant:
-      gpy, gpx = gy - (sry - spy), gx - (srx - spx)
-      if gpy < 0 or gpy >= len(self.__shape_instance_grid):
-        return False
-      if gpx < 0 or gpx >= len(self.__shape_instance_grid[0]):
-        return False
-      and_terms.append(
-          And(
-              self.__shape_instance_grid[gpy][gpx] == instance_id,
-              self.__shape_type_grid[gpy][gpx] == shape_index
+        if self.__allow_copies:
+          grid_shape = self.__shape_type_grid[y][x]
+          self.__solver.add((grid_instance == -1) == (grid_shape == -1))
+          for instance_index in range(self.__max_num_instances):
+            self.__solver.add(
+                Implies(
+                    grid_instance == instance_index,
+                    grid_shape == self.__instance_shapes[instance_index]
+                )
+            )
+
+  def __add_shape_constraints(self, shape_type):
+    valid_placements_by_coord = defaultdict(list)
+
+    for placement_index, placement in enumerate(self.__placements[shape_type]):
+      (ly, lx, variant_index) = placement
+      grid_instances = []
+      variant = self.__variants[shape_type][variant_index]
+      for (y, x) in ((ly + dy, lx + dx) for (dy, dx) in variant):
+        valid_placements_by_coord[(y, x)].append(placement_index)
+        grid_instances.append(self.__shape_instance_grid[y][x])
+
+      if self.__allow_copies:
+        for instance_index in range(self.__max_num_instances):
+          grid_constraints = [instance == instance_index for instance in grid_instances]
+          self.__solver.add(
+              Implies(
+                  And(
+                      self.__instance_shapes[instance_index] == shape_type,
+                      self.__instance_placements[instance_index] == placement_index
+                  ),
+                  And(*grid_constraints)
+              )
           )
-      )
-    return And(*and_terms)
+      else:
+        grid_constraints = [instance == shape_type for instance in grid_instances]
+        self.__solver.add(
+            Implies(
+                self.__instance_placements[shape_type] == placement_index,
+                And(*grid_constraints)
+            )
+        )
 
-  def __add_single_copy_constraints(self, shape_index, shape):
-    sum_terms = []
-    for y in range(len(self.__shape_type_grid)):
-      for x in range(len(self.__shape_type_grid[0])):
-        sum_terms.append(
-            (self.__shape_type_grid[y][x] == shape_index, 1))
-    self.__solver.add(PbEq(sum_terms, len(shape)))
+    for y in range(len(self.__shape_instance_grid)):
+      for x in range(len(self.__shape_instance_grid[0])):
+        if self.__allow_copies:
+          for instance_index in range(self.__max_num_instances):
+            placement = self.__instance_placements[instance_index]
+            self.__solver.add(
+                Implies(
+                    And(
+                        self.__shape_type_grid[y][x] == shape_type,
+                        self.__shape_instance_grid[y][x] == instance_index
+                    ),
+                    Or(*[
+                       (placement == p) for p in valid_placements_by_coord[(y, x)]
+                    ])
+                )
+            )
+        else:
+          placement = self.__instance_placements[shape_type]
+          self.__solver.add(
+              Implies(
+                  self.__shape_instance_grid[y][x] == shape_type,
+                  Or(*[
+                     placement == p for p in valid_placements_by_coord[(y, x)]
+                  ])
+              )
+          )
 
   @property
   def solver(self) -> Solver:
@@ -251,7 +358,10 @@ class ShapeConstrainer:
     indexed by the shapes list passed in to the #ShapeConstrainer constructor),
     or -1 if no shape is placed within that cell.
     """
-    return self.__shape_type_grid
+    if self.__allow_copies:
+      return self.__shape_type_grid
+    else:
+      return self.__shape_instance_grid
 
   @property
   def shape_instance_grid(self) -> List[List[ArithRef]]:
@@ -268,7 +378,7 @@ class ShapeConstrainer:
     Should be called only after the solver has been checked.
     """
     model = self.__solver.model()
-    for row in self.__shape_type_grid:
+    for row in self.shape_type_grid:
       for v in row:
         shape_index = model.eval(v).as_long()
         if shape_index >= 0:
@@ -283,7 +393,7 @@ class ShapeConstrainer:
     Should be called only after the solver has been checked.
     """
     model = self.__solver.model()
-    for row in self.__shape_instance_grid:
+    for row in self.shape_instance_grid:
       for v in row:
         shape_index = model.eval(v).as_long()
         if shape_index >= 0:
@@ -291,3 +401,17 @@ class ShapeConstrainer:
         else:
           sys.stdout.write("   ")
       print()
+
+    print("FOR DEBUGGING:")
+    for instance_index in range(self.__max_num_instances):
+      if self.__allow_copies:
+        shape = model.eval(self.__instance_shapes[instance_index]).as_long()
+      else:
+        shape = instance_index
+      placement = model.eval(self.__instance_placements[instance_index]).as_long()
+      print(f"Instance {instance_index} has shape {shape} and placement {placement}")
+      if shape != -1 and placement != -1:
+        (ly, lx, variant_index) = self.__placements[shape][placement]
+        print(f"... with ly={ly}, lx={lx}, variant={variant_index}")
+        variant = self.__variants[shape][variant_index];
+        print(f"... with {variant}")

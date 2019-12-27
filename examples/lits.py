@@ -131,7 +131,8 @@ def main():
       solver=sg.solver,
       allow_rotations=True,
       allow_reflections=True,
-      allow_copies=True
+      allow_copies=True,
+      max_num_instances=len({c for line in AREAS for c in line})
   )
 
   link_symbols_to_shapes(sym, sg, sc)
