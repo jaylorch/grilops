@@ -107,6 +107,7 @@ class ShapeConstrainer:
       max_num_instances: int = None
   ):
     ShapeConstrainer._instance_index += 1
+
     if solver:
       self.__solver = solver
     else:
@@ -132,6 +133,7 @@ class ShapeConstrainer:
     self.__create_grids(height, width)
     self.__create_instances()
     self.__add_constraints()
+
 
   def __make_variants(self, allow_rotations, allow_reflections):
     all_variants = []
@@ -260,46 +262,57 @@ class ShapeConstrainer:
       placement_var = self.__instance_placements[instance_index]
       possibilities = []
 
+      # Compute the sequence of pseudo-booleans representing which
+      # grid elements belong to this instance.
+    
+      instance_terms = [
+          (self.__shape_instance_grid[y][x] == instance_index, 1)
+          for x in range(width)
+          for y in range(height)
+      ]
+
       # Add the possibility that this instance isn't in the grid.
       # This is only the case if the instance index is >= the minimum
       # number of instances.
 
       if instance_index >= self.__min_num_instances:
-        all_not_this_one = [
-            self.__shape_instance_grid[y][x] != instance_index
-            for x in range(width)
-            for y in range(height)
-        ]
-        instance_missing = And(placement_var == -1, *all_not_this_one)
+        instance_missing = And(placement_var == -1, PbEq(instance_terms, 0))
         possibilities.append(instance_missing)
 
       # For each placement, add it as a possibility.
 
       for placement_index, placement in enumerate(self.__placements):
         (ly, lx, shape_index, variant_index) = placement
+
+        # If we don't allow copies, skip any placement whose shape
+        # index doesn't correspond to this instance index.
+
         if shape_index != instance_index and not self.__allow_copies:
           continue
+
         variant = self.__variants[shape_index][variant_index]
-        coords = { (ly + dy, lx + dx) for (dy, dx) in variant }
+
+        instance_constraints = [
+            self.__shape_instance_grid[ly+dy][lx+dx] == instance_index
+            for (dy, dx) in variant
+        ]
 
         if self.__allow_copies:
-          in_fn = (lambda y, x :
-              And(
-                  self.__shape_instance_grid[y][x] == instance_index,
-                  self.__shape_type_grid[y][x] == shape_index
-              )
-          )
+          shape_constraints = [
+              self.__shape_type_grid[ly+dy][lx+dx] == shape_index
+              for (dy, dx) in variant
+          ]
         else:
-          in_fn = (lambda y, x :
-              self.__shape_instance_grid[y][x] == instance_index
-          )
-        out_fn = (lambda y, x :
-            self.__shape_instance_grid[y][x] != instance_index
-        )
-        fn = lambda y, x : (in_fn(y, x) if (y, x) in coords else out_fn(y, x))
+          shape_constraints = []
 
-        constraints = [fn(y, x) for x in range(width) for y in range(height)]
-        possibilities.append(And(placement_var == placement_index, *constraints))
+        possibilities.append(
+            And(
+                placement_var == placement_index,
+                PbEq(instance_terms, len(variant)),
+                *instance_constraints,
+                *shape_constraints
+            )
+        )
 
       self.__solver.add(Or(*possibilities))
 
