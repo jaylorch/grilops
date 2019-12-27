@@ -40,6 +40,7 @@ def link_symbols_to_shapes(sym, sg, sc):
 
 def add_area_constraints(sc):
   """Ensure each area of the puzzle contains exactly one tetromino."""
+  num_areas=len({c for line in AREAS for c in line})
   for area_label in {c for line in AREAS for c in line}:
     area_type_cells = []
     area_instance_cells = []
@@ -56,7 +57,7 @@ def add_area_constraints(sc):
 
     area_instance = Int(f"ai-{area_label}")
     sc.solver.add(area_instance >= 0)
-    sc.solver.add(area_instance < HEIGHT * WIDTH)
+    sc.solver.add(area_instance < num_areas)
     sc.solver.add(And(
         *[Or(c == -1, c == area_instance) for c in area_instance_cells]))
 
@@ -119,6 +120,7 @@ def main():
   sym = grilops.SymbolSet(["L", "I", "T", "S", ("W", " ")])
   sg = grilops.SymbolGrid(HEIGHT, WIDTH, sym)
   rc = grilops.regions.RegionConstrainer(HEIGHT, WIDTH, solver=sg.solver)
+  num_areas=len({c for line in AREAS for c in line})
   sc = grilops.shapes.ShapeConstrainer(
       HEIGHT,
       WIDTH,
@@ -132,7 +134,8 @@ def main():
       allow_rotations=True,
       allow_reflections=True,
       allow_copies=True,
-      max_num_instances=len({c for line in AREAS for c in line})
+      min_num_instances=num_areas,
+      max_num_instances=num_areas
   )
 
   link_symbols_to_shapes(sym, sg, sc)
